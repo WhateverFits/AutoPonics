@@ -1,5 +1,4 @@
 #include <ArduinoJson.h>
-#include <Time.h>
 #include <TimeLib.h>
 #include <TimeAlarms.h>
 #include <Timezone.h>
@@ -11,30 +10,24 @@
 #include <EasyButton.h>
 #include <PubSubClient.h>
 #include <stdint.h>
-#include <RTClib.h>
 #include <jled.h>
 #include "Config.h"
 #include "AutoPonics.h"
 #include "Formatting.h"
-#include "Webserver.h"
 
 // MQTT method headers
-void mqttPublish(const char* status);
+void mqttPublish(bool light, bool water);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 // Alarm header
 void setupAlarms();
-
-// Web Server
-Webserver server = Webserver(80, setupAlarms);
 
 // WiFi connection
 ESP8266WiFiMulti wifiMulti;
 WiFiClient mqttWiFiClient;
 PubSubClient mqttClient(MQTT_SERVER, MQTT_PORT, mqttCallback, mqttWiFiClient);
 
-// NTP and RTC
-//RTC_DS3231 rtc;
+// NTP
 WiFiUDP Udp;
 
 // Control button
@@ -49,45 +42,64 @@ Timezone myTZ(myDST, mySTD);
 long lastTime = 0;
 long lastTimeClock = 0;
 time_t utc, local;
+byte waterduration;
 
 // Alarms
-int morningIndex = -1;
-int eveningIndex = -1;
+int lightOnIndex = -1;
+int lightOffIndex = -1;
+int waterOnIndex = -1;
+int waterOffIndex = -1;
 
 bool connectedOnce = false;
+bool lightState = false;
+bool waterState = false;
 
 String mqttClientId; 
 long lastReconnectAttempt = 0; 
 
 int ntpRetryCount = 3;
 int ntpRetry = 0;
-long rtcCount = RTCSTALECOUNT;
-int displayBrightness = CLOCKBRIGHT;
 
 TimeChangeRule *tcr;        //pointer to the time change rule, use to get TZ abbrev
 
-void MorningAlarm() {
-  bool enabled;
-  EEPROM.get(ENABLEDINDEX, enabled);
-  if (enabled) 
-  {
-    Serial.println("Good morning!");
-    time_t utc = now();
-    time_t local = myTZ.toLocal(utc, &tcr);
-    printTime(local, tcr -> abbrev);
-  }
+void LightOnAlarm() {
+	Serial.println("Good morning!");
+	time_t utc = now();
+	time_t local = myTZ.toLocal(utc, &tcr);
+	printTime(local, tcr -> abbrev);
+	lightState = true;
+	digitalWrite(LIGHTPIN, HIGH);
+	mqttPublish(lightState, waterState);
 }
 
-void EveningAlarm() {
-  bool enabled;
-  EEPROM.get(ENABLEDINDEX, enabled);
-  if (enabled) 
-  {
-    Serial.println("Good evening!");
-    time_t utc = now();
-    time_t local = myTZ.toLocal(utc, &tcr);
-    printTime(local, tcr -> abbrev);
-  }
+void LightOffAlarm() {
+	Serial.println("Good evening!");
+	time_t utc = now();
+	time_t local = myTZ.toLocal(utc, &tcr);
+	printTime(local, tcr -> abbrev);
+	lightState = false;
+	digitalWrite(LIGHTPIN, LOW);
+	mqttPublish(lightState, waterState);
+}
+
+void WaterOnAlarm() {
+	Serial.println("Flood cycle started");
+	time_t utc = now();
+	time_t local = myTZ.toLocal(utc, &tcr);
+	printTime(local, tcr -> abbrev);
+	waterState = true;
+	digitalWrite(WATERPIN, HIGH);
+	mqttPublish(lightState, waterState);
+}
+
+void WaterOffAlarm() {
+	Serial.println("Flood cycle finished");
+	time_t utc = now();
+	time_t local = myTZ.toLocal(utc, &tcr);
+	printTime(local, tcr -> abbrev);
+	waterState = false;
+	digitalWrite(WATERPIN, LOW);
+	mqttPublish(lightState, waterState);
 }
 
 int createAlarmUTC(int h, int m, OnTick_t onTickHandler) {
@@ -135,111 +147,54 @@ void setupAlarms() {
   mqttLog("setupAlarms - Exit");
 }
 
+void normalizeTime(byte *hour, byte *minute) {
+	if (*minute > 60) {
+		*minute -= 60;
+		*hour++;
+	}
+
+	if (*hour == 24) {
+		*hour = 0;
+	}
+}
+
 void getSunriseSunsetTimes() {
-  mqttLog("getSunriseSunsetTimes - Enter");
-  WiFiClient client;
-  const int httpPort = 80;
-  const char* host = "api.sunrise-sunset.org";
-  if (!client.connect(host, httpPort)) {
-    Serial.println("connection failed");
-    mqttLog("connection failed");
-    return;
-  }
+	mqttLog("getSunriseSunsetTimes - Enter");
+	byte hour;
+	byte minute;
+	byte lightduration;
+	EEPROM.get(FIXEDHOURINDEX, hour);
+	EEPROM.get(FIXEDMINUTEINDEX, minute);
+	EEPROM.get(WATERDURATIONINDEX, waterduration);
+	EEPROM.get(LIGHTDURATIONINDEX, lightduration);
 
-  // We now create a URI for the request
-  String url = "/json?lat=38.581572&lng=-121.494400&formatted=0";
-  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
-      "Host: " + host + "\r\n" +
-      "Connection: close\r\n\r\n");
-  unsigned long timeout = millis();
-  while (client.available() == 0) {
-    if (millis() - timeout > 5000) {
-      Serial.println(">>> Client Timeout !");
-      client.stop();
-      return;
-    }
-  }
 
-  while (client.available()) {
-    String line = client.readStringUntil('\r');
-    line = line.substring(1);
-    if (line[0] == '{') {
-      mqttLog("Received sunrise");
-      StaticJsonDocument<1000> doc;
-      DeserializationError err = deserializeJson(doc, line.substring(line.indexOf(':') + 1, line.lastIndexOf(',')));
-      //JsonObject& root = jsonBuffer.parseObject(line.substring(line.indexOf(':') + 1, line.lastIndexOf(',')));
-      String sunrise = doc["sunrise"];
-      String sunset = doc["sunset"];
+	waterOnIndex = createAlarm(hour, minute, LightOnAlarm);
 
-      Serial.print("Sunrise response: ");
-      Serial.println(sunrise);
+	minute += waterduration;
+	normalizeTime(&hour, &minute);
+	waterOffIndex = createAlarm(hour, minute, LightOnAlarm);
 
-      String sunriseHour = sunrise.substring(sunrise.indexOf('T') + 1, sunrise.indexOf(':'));
-      String sunriseMin = sunrise.substring(sunrise.indexOf(':') + 1, sunrise.indexOf(':') + 3);
-      String sunsetHour = sunset.substring(sunset.indexOf('T') + 1, sunset.indexOf(':'));
-      String sunsetMin = sunset.substring(sunset.indexOf(':') + 1, sunset.indexOf(':') + 3);
-      Serial.print("Sunrise UTC: ");
-      Serial.println(sunriseHour + ":" + sunriseMin);
-      Alarm.free(morningIndex);
-      Alarm.free(eveningIndex);
-      bool useSunrise;
-      byte hour;
-      byte minute;
-      EEPROM.get(USESUNRISEINDEX, useSunrise);
-      EEPROM.get(FIXEDTIMEINDEX, hour);
-      EEPROM.get(FIXEDTIMEINDEX + sizeof(byte), minute);
+	minute += 5;
+	normalizeTime(&hour, &minute);
+	lightOnIndex = createAlarm(hour, minute, LightOnAlarm);
 
-      if (useSunrise)
-      {
-        morningIndex = createAlarmUTC(sunriseHour.toInt(), sunriseMin.toInt(), MorningAlarm);
-        Serial.println("Sunrise alarm:" + sunriseHour + ":" + sunriseMin);
-      } 
-      else
-      {
-        int today = weekday(local);
-        Alarm.free(morningIndex);
-        if (today != 1 && today != 7)
-        {
-          morningIndex = createAlarm(hour, minute, MorningAlarm);
-          Serial.println("Sunrise alarm:" + String(hour) + ":" + String(minute));
-        }
-        else
-        {
-          Serial.print("Dude, sleep in! Today is ");
-          Serial.println(dayShortStr(today));
-        }
-      }
+	hour += lightduration;
+	normalizeTime(&hour, &minute);
+	lightOffIndex = createAlarm(hour, minute, LightOnAlarm);
 
-      int sunsetMinInt = sunsetMin.toInt();
-      int sunsetHourInt = sunsetHour.toInt();
-      Serial.print("Sunset UTC: ");
-      Serial.println(String(sunsetHourInt) + ":" + String(sunsetMinInt));
-      eveningIndex = createAlarmUTC(sunsetHourInt, sunsetMinInt, EveningAlarm);
-
-      // Make moonrise
-      sunsetMinInt += 20;
-      if (sunsetMinInt > 60) {
-        sunsetMinInt -= 60;
-        sunsetHourInt++;
-        if (sunsetHourInt == 24) {
-          sunsetHourInt = 0;
-        }
-      }
-
-      break;
-    }
-  }
-
-  Serial.println();
-  Serial.println("closing connection");
-  mqttLog("getSunriseSunsetTimes - Exit");
+	Serial.println();
+	Serial.println("closing connection");
+	mqttLog("getSunriseSunsetTimes - Exit");
 }
 
 // When the button is short pressed, execute this
 void onPressed() {
-
-  // Reset the clock timer so that the RISE or SET displays for a second
-  lastTimeClock = millis();
+	if (lightState)
+		LightOffAlarm();
+	else
+		LightOnAlarm();
+	lastTimeClock = millis();
 }
 
 // When the button is held for 1000 ms, execute this
@@ -247,6 +202,16 @@ void onPressedForDuration() {
   Serial.println("Fast Toggle from long press");
 
   // Reset the clock timer so that the RISE or SET displays for a second
+	if (waterState)
+		WaterOffAlarm();
+	else
+	{
+		WaterOnAlarm();
+		byte h = hour(now());
+		byte m = minute(now()) + waterduration;
+		normalizeTime(&h, &m);
+		createAlarm(h, m, WaterOffAlarm);
+	}
   lastTimeClock = millis();
 }
 
@@ -285,17 +250,6 @@ String IpAddress2String(const IPAddress& ipAddress)
 
 time_t getNtpTime()
 {
-  // Check if we have a time and it isn't too stale.
-//  if (!rtc.lostPower() && rtcCount < RTCSTALECOUNT) {
-//    rtcCount++;
-//    Serial.println("Returning RTC value");
-//    long u = rtc.now().unixtime();
-//    Serial.print("rtc: ");
-//    Serial.println(u);
-//    return u;
-//  }
-
-
   if (wifiMulti.run() == WL_CONNECTED) {
     while (Udp.parsePacket() > 0) ; // discard any previously received packets
     // Fall back to using the global NTP pool server in case we cannot connect to internal NTP server
@@ -321,15 +275,8 @@ time_t getNtpTime()
         // Make sure we chill a little
         setSyncInterval(200);
         unsigned long calcTime = secsSince1900 - 2208988800UL;// + timeZone * SECS_PER_HOUR;
-        //rtc.adjust(DateTime(calcTime));
-        //DateTime timeNow = rtc.now();
-        //long u = timeNow.unixtime();
-        //Serial.print("rtc: ");
-        //Serial.println(u);
         Serial.print("ntp: ");
         Serial.println(calcTime);
-        // Reset the RTC stale counter. 
-        rtcCount = 0;
         return calcTime;
       }
     }
@@ -344,13 +291,7 @@ time_t getNtpTime()
   // We couldn't connect so we are gonna try harder!
   Serial.println("NTP n");
   setSyncInterval(5);
-//  if (!rtc.lostPower()) {
-//    Serial.println("NTP o");
-//    return rtc.now().unixtime(); // return now if unable to get the time so we just get our RTC's time.
-//  } else {
-//    Serial.println("NTP p");
-    return now(); // return now if unable to get the time so we just get our drifted internal time instead of wrong time.
-//  }
+  return now(); // return now if unable to get the time so we just get our drifted internal time instead of wrong time.
 }
 
 // The callback when an MQTT message is received. We only listen to one topic (control)
@@ -365,6 +306,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println(action);
 
   //if (action == "Sunrise") sunrise.StartSunrise();
+  if (action == "WaterOn") {
+	  WaterOnAlarm();
+  }
+  if (action == "WaterOff") {
+	  WaterOffAlarm();
+  }
+  if (action == "LightOn") {
+	  LightOnAlarm();
+  }
+  if (action == "LightOff") {
+	  LightOffAlarm();
+  }
   if (action == "Update") {
     WiFiClient updateWiFiClient;
     t_httpUpdate_return ret = ESPhttpUpdate.update(updateWiFiClient, UPDATE_URL);
@@ -385,10 +338,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 // Send out the provided message in JSON format to home/DNSNAME/state
-void mqttPublish(const char* status) {
+void mqttPublish(bool light, bool water) {
   if (mqttClient.connected()) {
     DynamicJsonDocument mqttDoc(1024);
-    mqttDoc["Status"] = status;
+    mqttDoc["LightStatus"] = light ? "On" : "Off";
+    mqttDoc["WaterStatus"] = water ? "On" : "Off";
     time_t utc = now();
     time_t local = myTZ.toLocal(utc, &tcr);
     mqttDoc["Date"] = formatTime(local, tcr -> abbrev);
@@ -476,6 +430,7 @@ void onConnect() {
   connectedOnce = true;
   Udp.begin(LOCALUDPPORT);
   setSyncProvider(getNtpTime);
+  mqttPublish(lightState, waterState);
 }
 
 void setupWiFi(){
@@ -490,7 +445,7 @@ void setupWiFi(){
   uint8_t macAddr[6];
   WiFi.macAddress(macAddr);
   sprintf(buffer, "%02x%02x", macAddr[4], macAddr[5]);
-  WiFi.hostname("SunriseLight" + String(buffer));
+  WiFi.hostname("AutoPonics" + String(buffer));
 #endif
 
   for (int i=0; i < wifiCount; i++) {
@@ -502,7 +457,6 @@ void setupWiFi(){
 }
 
 bool validateWiFi(long milliseconds) {
-  //return connectedOnce;
   // Update WiFi status. Take care of rollover
   if (milliseconds >= lastTimeClock + 1000 || milliseconds < lastTimeClock) {
     if (wifiMulti.run() != WL_CONNECTED) {
@@ -550,22 +504,9 @@ void setup() {
   Serial.println();
   Serial.println();
 
-  //rtc.begin();
-
-//  if (!rtc.lostPower()) {
-//    utc = rtc.now().unixtime();
-//    Serial.print("rtc: ");
-//    Serial.println(utc);
-//    local = myTZ.toLocal(utc, &tcr);
-//    tm1637.dispNumber(hour(local) * 100 + minute(local));
-//  } else {
-//    Serial.println("rtc: lost power.");
-//  }
-
   setupWiFi();
 
   EEPROM.begin(10);
-  server.Initialize();
 
   button.begin();
   // Add the callback function to be called when the button is pressed.
@@ -582,8 +523,6 @@ void setup() {
 }
 
 void loop() {
-  //wifiMulti.run();
-
   Alarm.delay(0);
   button.read();
 
@@ -592,7 +531,6 @@ void loop() {
   // Check if connected then handle the connected magic
   if (validateWiFi(milliseconds)) {
     validateMqtt(milliseconds);
-    server.HandleClient();
 
     // Check the time. Set alarms. Take care of rollover
     if (milliseconds >= lastTime + 7200000 || milliseconds < lastTime || lastTime == 0 ) {
@@ -602,7 +540,5 @@ void loop() {
     }
 
     utc = now();
-//  } else {
-//    utc = rtc.now().unixtime();
   }
 }
