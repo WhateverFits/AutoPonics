@@ -16,6 +16,8 @@
 #define MQTT_CHANNEL_PUB "home/" DNSNAME "/state"
 #define MQTT_CHANNEL_SUB "home/" DNSNAME "/control"
 #define MQTT_CHANNEL_LOG "home/" DNSNAME "/log"
+#define MQTT_CHANNEL_TEMP "home/" DNSNAME "/temp"
+#define MQTT_CHANNEL_HUMID "home/" DNSNAME "/humidity"
 #define MQTT_USER "clockuser"
 #define MQTT_PASSWORD "clockuser"
 #define UPDATE_URL "http://pi4/cgi-bin/test.rb"

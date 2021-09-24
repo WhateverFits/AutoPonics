@@ -15,12 +15,19 @@
 #include "AutoPonics.h"
 #include "Formatting.h"
 
+#include "Adafruit_Sensor.h"
+#include "Adafruit_AM2320.h"
+
+Adafruit_AM2320 am2320 = Adafruit_AM2320();
+
+
+
 // MQTT method headers
 void mqttPublish(bool light, bool water);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 // Alarm header
-void setupAlarms();
+void setupAlarms(bool checkState);
 
 // WiFi connection
 ESP8266WiFiMulti wifiMulti;
@@ -37,12 +44,21 @@ EasyButton button(BUTTON_PIN);
 TimeChangeRule myDST = {"PDT", Second, Sun, Mar, 2, -420};    //Daylight time = UTC - 7 hours
 TimeChangeRule mySTD = {"PST", First, Sun, Nov, 2, -480};     //Standard time = UTC - 8 hours
 Timezone myTZ(myDST, mySTD);
+TimeChangeRule *tcr;        //pointer to the time change rule, use to get TZ abbrev
 
 // Locals
-long lastTime = 0;
-long lastTimeClock = 0;
-time_t utc, local;
+unsigned long lastTimeClock = 0;
+time_t local;
 byte waterduration;
+float temp;
+float humid;
+bool lightState = false;
+bool waterState = false;
+bool connectedOnce = false;
+String mqttClientId; 
+unsigned long lastReconnectAttempt = 0; 
+int ntpRetryCount = 3;
+int ntpRetry = 0;
 
 // Alarms
 int lightOnIndex = -1;
@@ -50,56 +66,44 @@ int lightOffIndex = -1;
 int waterOnIndex = -1;
 int waterOffIndex = -1;
 
-bool connectedOnce = false;
-bool lightState = false;
-bool waterState = false;
-
-String mqttClientId; 
-long lastReconnectAttempt = 0; 
-
-int ntpRetryCount = 3;
-int ntpRetry = 0;
-
-TimeChangeRule *tcr;        //pointer to the time change rule, use to get TZ abbrev
-
 void LightOnAlarm() {
-	Serial.println("Good morning!");
-	time_t utc = now();
-	time_t local = myTZ.toLocal(utc, &tcr);
-	printTime(local, tcr -> abbrev);
-	lightState = true;
-	digitalWrite(LIGHTPIN, HIGH);
-	mqttPublish(lightState, waterState);
+  Serial.println("Good morning!");
+  time_t utc = now();
+  time_t local = myTZ.toLocal(utc, &tcr);
+  printTime(local, tcr -> abbrev);
+  lightState = true;
+  digitalWrite(LIGHTPIN, HIGH);
+  mqttPublish(lightState, waterState);
 }
 
 void LightOffAlarm() {
-	Serial.println("Good evening!");
-	time_t utc = now();
-	time_t local = myTZ.toLocal(utc, &tcr);
-	printTime(local, tcr -> abbrev);
-	lightState = false;
-	digitalWrite(LIGHTPIN, LOW);
-	mqttPublish(lightState, waterState);
+  Serial.println("Good evening!");
+  time_t utc = now();
+  time_t local = myTZ.toLocal(utc, &tcr);
+  printTime(local, tcr -> abbrev);
+  lightState = false;
+  digitalWrite(LIGHTPIN, LOW);
+  mqttPublish(lightState, waterState);
 }
 
 void WaterOnAlarm() {
-	Serial.println("Flood cycle started");
-	time_t utc = now();
-	time_t local = myTZ.toLocal(utc, &tcr);
-	printTime(local, tcr -> abbrev);
-	waterState = true;
-	digitalWrite(WATERPIN, HIGH);
-	mqttPublish(lightState, waterState);
+  Serial.println("Flood cycle started");
+  time_t utc = now();
+  time_t local = myTZ.toLocal(utc, &tcr);
+  printTime(local, tcr -> abbrev);
+  waterState = true;
+  digitalWrite(WATERPIN, HIGH);
+  mqttPublish(lightState, waterState);
 }
 
 void WaterOffAlarm() {
-	Serial.println("Flood cycle finished");
-	time_t utc = now();
-	time_t local = myTZ.toLocal(utc, &tcr);
-	printTime(local, tcr -> abbrev);
-	waterState = false;
-	digitalWrite(WATERPIN, LOW);
-	mqttPublish(lightState, waterState);
+  Serial.println("Flood cycle finished");
+  time_t utc = now();
+  time_t local = myTZ.toLocal(utc, &tcr);
+  printTime(local, tcr -> abbrev);
+  waterState = false;
+  digitalWrite(WATERPIN, LOW);
+  mqttPublish(lightState, waterState);
 }
 
 int createAlarmUTC(int h, int m, OnTick_t onTickHandler) {
@@ -137,64 +141,87 @@ int createAlarm(int h, int m, OnTick_t onTickHandler) {
   return Alarm.alarmOnce(hour(utc), m, 0, onTickHandler);
 }
 
-void setupAlarms() {
+void setupAlarms(bool checkState) {
   mqttLog("setupAlarms - Enter");
   for (int i = 0; i < dtNBR_ALARMS; i++) {
     Alarm.free(i);
   }
 
-  getSunriseSunsetTimes();
+  byte hour;
+  byte minute;
+  byte lightduration;
+  byte waterduration;
+  EEPROM.get(FIXEDHOURINDEX, hour);
+  EEPROM.get(FIXEDMINUTEINDEX, minute);
+  EEPROM.get(WATERDURATIONINDEX, waterduration);
+  EEPROM.get(LIGHTDURATIONINDEX, lightduration);
+
+  waterOnIndex = createAlarm(hour, minute, WaterOnAlarm);
+  byte waterOnH = hour;
+  byte waterOnM = minute;
+
+  minute += waterduration;
+  normalizeTime(&hour, &minute);
+  waterOffIndex = createAlarm(hour, minute, WaterOffAlarm);
+  byte waterOffH = hour;
+  byte waterOffM = minute;
+
+  minute += 5;
+  normalizeTime(&hour, &minute);
+  lightOnIndex = createAlarm(hour, minute, LightOnAlarm);
+  byte lightOnH = hour;
+  byte lightOnM = minute;
+
+  hour += lightduration;
+  normalizeTime(&hour, &minute);
+  lightOffIndex = createAlarm(hour, minute, LightOffAlarm);
+
+  if (checkState) {
+    Serial.println("Checking state");
+    time_t utc = now();
+    time_t local = myTZ.toLocal(utc, &tcr);
+
+    TimeElements t;
+    t.Second = 0;
+    t.Minute = lightOnM;
+    t.Hour = lightOnH;
+    time_t holding = now();
+    t.Day = day(holding);
+    t.Month = month(holding);
+    t.Year = year(holding) - 1970;
+
+    time_t onTime = makeTime(t);
+
+    t.Minute = minute;
+    t.Hour = hour;
+    time_t offTime = makeTime(t);
+
+    if (local >= onTime && local <= offTime){
+      Serial.println("Turning on because it should have been on.");
+      LightOnAlarm();
+    }
+  }
+
   mqttLog("setupAlarms - Exit");
 }
 
 void normalizeTime(byte *hour, byte *minute) {
-	if (*minute > 60) {
-		*minute -= 60;
-		*hour++;
-	}
+  if (*minute > 60) {
+    *minute -= 60;
+    *hour++;
+  }
 
-	if (*hour == 24) {
-		*hour = 0;
-	}
+  if (*hour == 24) {
+    *hour = 0;
+  }
 }
-
-void getSunriseSunsetTimes() {
-	mqttLog("getSunriseSunsetTimes - Enter");
-	byte hour;
-	byte minute;
-	byte lightduration;
-	EEPROM.get(FIXEDHOURINDEX, hour);
-	EEPROM.get(FIXEDMINUTEINDEX, minute);
-	EEPROM.get(WATERDURATIONINDEX, waterduration);
-	EEPROM.get(LIGHTDURATIONINDEX, lightduration);
-
-
-	waterOnIndex = createAlarm(hour, minute, LightOnAlarm);
-
-	minute += waterduration;
-	normalizeTime(&hour, &minute);
-	waterOffIndex = createAlarm(hour, minute, LightOnAlarm);
-
-	minute += 5;
-	normalizeTime(&hour, &minute);
-	lightOnIndex = createAlarm(hour, minute, LightOnAlarm);
-
-	hour += lightduration;
-	normalizeTime(&hour, &minute);
-	lightOffIndex = createAlarm(hour, minute, LightOnAlarm);
-
-	Serial.println();
-	Serial.println("closing connection");
-	mqttLog("getSunriseSunsetTimes - Exit");
-}
-
 // When the button is short pressed, execute this
 void onPressed() {
-	if (lightState)
-		LightOffAlarm();
-	else
-		LightOnAlarm();
-	lastTimeClock = millis();
+  if (lightState)
+    LightOffAlarm();
+  else
+    LightOnAlarm();
+  lastTimeClock = millis();
 }
 
 // When the button is held for 1000 ms, execute this
@@ -202,16 +229,16 @@ void onPressedForDuration() {
   Serial.println("Fast Toggle from long press");
 
   // Reset the clock timer so that the RISE or SET displays for a second
-	if (waterState)
-		WaterOffAlarm();
-	else
-	{
-		WaterOnAlarm();
-		byte h = hour(now());
-		byte m = minute(now()) + waterduration;
-		normalizeTime(&h, &m);
-		createAlarm(h, m, WaterOffAlarm);
-	}
+  if (waterState)
+    WaterOffAlarm();
+  else
+  {
+    WaterOnAlarm();
+    byte h = hour(now());
+    byte m = minute(now()) + waterduration;
+    normalizeTime(&h, &m);
+    createAlarm(h, m, WaterOffAlarm);
+  }
   lastTimeClock = millis();
 }
 
@@ -307,17 +334,50 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   //if (action == "Sunrise") sunrise.StartSunrise();
   if (action == "WaterOn") {
-	  WaterOnAlarm();
+    WaterOnAlarm();
   }
-  if (action == "WaterOff") {
-	  WaterOffAlarm();
+  else if (action == "WaterOff") {
+    WaterOffAlarm();
   }
-  if (action == "LightOn") {
-	  LightOnAlarm();
+  else if (action == "LightOn") {
+    LightOnAlarm();
   }
-  if (action == "LightOff") {
-	  LightOffAlarm();
+  else if (action == "LightOff") {
+    LightOffAlarm();
   }
+  if (action.indexOf("SetStartTime=")== 0) {
+    String time = action.substring(13);
+    int idx = action.indexOf(':');
+    String hourStr = action.substring(0,idx);
+    String minStr = action.substring(idx+1);
+    int hour = hourStr.toInt();
+    int minute = minStr.toInt();
+    if (hour < 24 && hour >= 0 && minute < 60 && minute >= 0) {
+      EEPROM.put(FIXEDHOURINDEX, (byte)hour);
+      EEPROM.put(FIXEDMINUTEINDEX, (byte)minute);
+      EEPROM.commit();
+    }
+    setupAlarms(true);
+  }
+  if (action.indexOf("SetWaterMin=")== 0) {
+    String time = action.substring(12);
+    int minutes = time.toInt();
+    if (minutes < 60 && minutes > 0) {
+      EEPROM.put(WATERDURATIONINDEX, (byte)minutes);
+      EEPROM.commit();
+    }
+    setupAlarms(true);
+  }
+  if (action.indexOf("SetLightHour=")== 0) {
+    String time = action.substring(13);
+    int hours = time.toInt();
+    if (hours < 20 && hours > 0) {
+      EEPROM.put(LIGHTDURATIONINDEX, (byte)hours);
+      EEPROM.commit();
+    }
+    setupAlarms(true);
+  }
+
   if (action == "Update") {
     WiFiClient updateWiFiClient;
     t_httpUpdate_return ret = ESPhttpUpdate.update(updateWiFiClient, UPDATE_URL);
@@ -450,15 +510,17 @@ void setupWiFi(){
 
   for (int i=0; i < wifiCount; i++) {
     wifiMulti.addAP(ssids[i], passs[i]);
+    Serial.println(ssids[i]);
   }
   Serial.println("Connecting");
   wifiMulti.run();
   //WiFi.begin(ssids[0], passs[0]);
 }
 
-bool validateWiFi(long milliseconds) {
+bool validateWiFi(unsigned long milliseconds) {
   // Update WiFi status. Take care of rollover
   if (milliseconds >= lastTimeClock + 1000 || milliseconds < lastTimeClock) {
+    lastTimeClock = milliseconds;
     if (wifiMulti.run() != WL_CONNECTED) {
       Serial.println("Disconnected");
       connectedOnce = false;
@@ -476,12 +538,11 @@ bool validateWiFi(long milliseconds) {
   return connectedOnce;
 }
 
-void validateMqtt(long milliseconds) {
+void validateMqtt(unsigned long milliseconds) {
   if (!mqttClient.connected()) {
-    if (milliseconds - lastReconnectAttempt > 5000 || lastReconnectAttempt == 0 || milliseconds < lastReconnectAttempt) {
-      Serial.println("MQTT not connected");
+    if (milliseconds - lastReconnectAttempt > 5000 || milliseconds < lastReconnectAttempt) {
       lastReconnectAttempt = milliseconds;
-      Serial.println("MQTT reconnecting");
+      Serial.println("MQTT not connected");
       // Attempt to reconnect
       if (mqttReconnect()) {
         Serial.println("MQTT reconnected");
@@ -498,11 +559,50 @@ void validateMqtt(long milliseconds) {
   }
 }
 
+void mqttPublishTempHumid(float temperature, float humidity) {
+  char buf[256];
+  if (mqttClient.connected()) {
+    String(temperature).toCharArray(buf, 256);
+    mqttClient.publish(MQTT_CHANNEL_TEMP, buf, true);
+    String(humidity).toCharArray(buf, 256);
+    mqttClient.publish(MQTT_CHANNEL_HUMID, buf, true);
+  }
+}
+
+long lastTimeSense = 0;
+// Get the temperature and humidity
+bool getTempHumid(long milliseconds) {
+  if (milliseconds >= lastTimeSense + 600000 || lastTimeSense == 0 || milliseconds < lastTimeSense) {
+    lastTimeSense = milliseconds;
+    temp = am2320.readTemperature();
+    humid = am2320.readHumidity();
+    if (isnan(humid) || isnan(temp)) {
+      Serial.println("Failed to read from DHT sensor!");
+      return false;
+    }
+    Serial.print("Temp: "); Serial.println(temp);
+    Serial.print("Hum: "); Serial.println(humid);
+    return true;
+  }
+
+  return false;
+}
+
+// Publish the temperature and humidity for monitoring
+void logTempHumid() {
+  if (mqttReconnect()) {
+    mqttPublishTempHumid(temp, humid);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println();
   Serial.println();
+
+  pinMode(LIGHTPIN, OUTPUT);
+  pinMode(WATERPIN, OUTPUT);
 
   setupWiFi();
 
@@ -520,25 +620,29 @@ void setup() {
   ESPhttpUpdate.onEnd(updateFinished);
   ESPhttpUpdate.onProgress(updateProgress);
   ESPhttpUpdate.onError(updateError);
+  setupAlarms(false);
+  Serial.print("Current time:"); Serial.println(now());
 }
 
+bool checkedStatus = false;
 void loop() {
   Alarm.delay(0);
   button.read();
 
-  long milliseconds = millis();
+  unsigned long milliseconds = millis();
 
   // Check if connected then handle the connected magic
   if (validateWiFi(milliseconds)) {
     validateMqtt(milliseconds);
 
-    // Check the time. Set alarms. Take care of rollover
-    if (milliseconds >= lastTime + 7200000 || milliseconds < lastTime || lastTime == 0 ) {
-      printTime(local, tcr -> abbrev);
-      lastTime = milliseconds;
-      setupAlarms();
+    if (getTempHumid(milliseconds)) {
+      logTempHumid();
     }
 
-    utc = now();
+    if (!checkedStatus){
+      setupAlarms(true);
+      checkedStatus = true;
+    }
   }
+  delay(50);
 }
