@@ -119,10 +119,10 @@ int createAlarmUTC(int h, int m, OnTick_t onTickHandler) {
 
   time_t utc = makeTime(t);
   mqttLog(("UTC Alarm set for " + String(h) + ":" + String(m)));
-  return Alarm.alarmOnce(hour(utc), m, 0, onTickHandler);
+  return Alarm.alarmRepeat(hour(utc), m, 0, onTickHandler);
 }
 
-int createAlarm(int h, int m, OnTick_t onTickHandler) {
+int createAlarm(int h, int m, OnTick_t onTickHandler, String name) {
   TimeElements t;
   t.Second = 0;
   t.Minute = m;
@@ -138,7 +138,8 @@ int createAlarm(int h, int m, OnTick_t onTickHandler) {
   Serial.print(hour(utc));
   Serial.print(":");
   Serial.println(m);
-  return Alarm.alarmOnce(hour(utc), m, 0, onTickHandler);
+  mqttLog("CreateAlarm " + name + ":"` + String(hour(utc)) + ":" + Strimg(m));
+  return Alarm.alarmRepeat(hour(utc), m, 0, onTickHandler);
 }
 
 void setupAlarms(bool checkState) {
@@ -156,25 +157,25 @@ void setupAlarms(bool checkState) {
   EEPROM.get(WATERDURATIONINDEX, waterduration);
   EEPROM.get(LIGHTDURATIONINDEX, lightduration);
 
-  waterOnIndex = createAlarm(hour, minute, WaterOnAlarm);
+  waterOnIndex = createAlarm(hour, minute, WaterOnAlarm, "WaterOn");
   byte waterOnH = hour;
   byte waterOnM = minute;
 
   minute += waterduration;
   normalizeTime(&hour, &minute);
-  waterOffIndex = createAlarm(hour, minute, WaterOffAlarm);
+  waterOffIndex = createAlarm(hour, minute, WaterOffAlarm, "WaterOff");
   byte waterOffH = hour;
   byte waterOffM = minute;
 
   minute += 5;
   normalizeTime(&hour, &minute);
-  lightOnIndex = createAlarm(hour, minute, LightOnAlarm);
+  lightOnIndex = createAlarm(hour, minute, LightOnAlarm, "LightOn");
   byte lightOnH = hour;
   byte lightOnM = minute;
 
   hour += lightduration;
   normalizeTime(&hour, &minute);
-  lightOffIndex = createAlarm(hour, minute, LightOffAlarm);
+  lightOffIndex = createAlarm(hour, minute, LightOffAlarm, "LightOff");
 
   if (checkState) {
     Serial.println("Checking state");
@@ -199,6 +200,8 @@ void setupAlarms(bool checkState) {
     if (local >= onTime && local <= offTime){
       Serial.println("Turning on because it should have been on.");
       LightOnAlarm();
+    } else {
+      LightOffAlarm();
     }
   }
 
@@ -237,7 +240,7 @@ void onPressedForDuration() {
     byte h = hour(now());
     byte m = minute(now()) + waterduration;
     normalizeTime(&h, &m);
-    createAlarm(h, m, WaterOffAlarm);
+    createAlarm(h, m, WaterOffAlarm, "WaterOff");
   }
   lastTimeClock = millis();
 }

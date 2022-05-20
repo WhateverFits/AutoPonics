@@ -23,8 +23,8 @@ const char* formatTime(time_t t, char *tz)
 {
   char buf[200];
   sprintf(buf, 
-  	"%02d:%02d:%02d %d %s %04d %s", hour(t), minute(t), second(t), 
-	day(t), monthShortStr(month(t)), year(t), tz);
+      "%02d:%02d:%02d %d %s %04d %s", hour(t), minute(t), second(t), 
+      day(t), monthShortStr(month(t)), year(t), tz);
   Serial.println(buf);
   return buf;
 }
